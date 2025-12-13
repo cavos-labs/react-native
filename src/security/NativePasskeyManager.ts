@@ -1,17 +1,26 @@
 /**
  * NativePasskeyManager handles Passkey operations for React Native.
  * 
- * Key difference from WebAuthnManager:
- * - Uses configurable RP ID instead of window.location.hostname
- * - Uses react-native-passkey for native operations
- * - Uses react-native-quick-crypto for AES-GCM encryption
+ * Uses:
+ * - react-native-passkey for native passkey operations
+ * - expo-crypto for random bytes and hashing
+ * - @noble/ciphers for AES-GCM encryption (expo-crypto doesn't support it)
  */
 
 import { PasskeyResult } from '../types';
+import * as Crypto from 'expo-crypto';
+import { gcm } from '@noble/ciphers/aes.js';
 
-// These will be dynamically imported to avoid bundling issues
+/**
+ * Result from passkey registration
+ */
+export interface PasskeyRegistrationResult {
+    encryptionKey: CryptoKeyLike;
+    credentialId: string;
+}
+
+// Passkey module will be dynamically imported
 let Passkey: any = null;
-let QuickCrypto: any = null;
 
 export class NativePasskeyManager {
     private rpId: string;
@@ -23,7 +32,7 @@ export class NativePasskeyManager {
     }
 
     /**
-     * Initialize native dependencies
+     * Initialize passkey dependency
      */
     private async ensureDependencies(): Promise<void> {
         if (!Passkey) {
@@ -33,17 +42,6 @@ export class NativePasskeyManager {
             } catch (e) {
                 throw new Error(
                     'react-native-passkey is required. Install it with: npm install react-native-passkey'
-                );
-            }
-        }
-
-        if (!QuickCrypto) {
-            try {
-                const cryptoModule = require('react-native-quick-crypto');
-                QuickCrypto = cryptoModule.default || cryptoModule;
-            } catch (e) {
-                throw new Error(
-                    'react-native-quick-crypto is required. Install it with: npm install react-native-quick-crypto'
                 );
             }
         }
@@ -65,8 +63,9 @@ export class NativePasskeyManager {
      * Register a new Passkey and derive an encryption key
      * @param userId User's unique identifier (e.g. email or social ID)
      * @param challenge Random challenge for registration
+     * @returns Encryption key and credential ID
      */
-    async register(userId: string, challenge: Uint8Array): Promise<CryptoKeyLike> {
+    async register(userId: string, challenge: Uint8Array): Promise<PasskeyRegistrationResult> {
         await this.ensureDependencies();
 
         const challengeB64 = this.arrayBufferToBase64url(challenge.buffer as ArrayBuffer);
@@ -95,14 +94,41 @@ export class NativePasskeyManager {
         });
 
         // Derive encryption key from credential data
-        return this.deriveKeyFromCredential(result);
+        const encryptionKey = await this.deriveKeyFromCredential(result);
+
+        return {
+            encryptionKey,
+            credentialId: result.rawId,
+        };
+    }
+
+    /**
+     * Register a passkey with auto-generated anonymous userId
+     * For passkey-only wallet creation (no OAuth required)
+     */
+    async registerAnonymous(): Promise<PasskeyRegistrationResult> {
+        // Generate a random UUID as the anonymous userId
+        const anonymousId = Crypto.randomUUID();
+        const challenge = Crypto.getRandomBytes(32);
+
+        return this.register(anonymousId, challenge);
+    }
+
+    /**
+     * Register a new Passkey with provided userId (legacy method for compatibility)
+     * Returns only CryptoKeyLike for backward compatibility
+     */
+    async registerLegacy(userId: string, challenge: Uint8Array): Promise<CryptoKeyLike> {
+        const result = await this.register(userId, challenge);
+        return result.encryptionKey;
     }
 
     /**
      * Authenticate with existing Passkey and derive the same encryption key
      * @param challenge Random challenge for authentication
+     * @returns Encryption key and credential ID
      */
-    async authenticate(challenge: Uint8Array): Promise<CryptoKeyLike> {
+    async authenticate(challenge: Uint8Array): Promise<PasskeyRegistrationResult> {
         await this.ensureDependencies();
 
         const challengeB64 = this.arrayBufferToBase64url(challenge.buffer as ArrayBuffer);
@@ -114,76 +140,83 @@ export class NativePasskeyManager {
         });
 
         // Derive encryption key from credential data
-        return this.deriveKeyFromCredential(result);
+        const encryptionKey = await this.deriveKeyFromCredential(result);
+
+        return {
+            encryptionKey,
+            credentialId: result.rawId,
+        };
     }
 
     /**
      * Derive a stable encryption key from passkey credential
-     * Since PRF extension may not be available on all native platforms,
-     * we use HKDF with the credential ID and authenticator data as input
+     * Uses HMAC-SHA256 via expo-crypto
      */
     private async deriveKeyFromCredential(result: PasskeyResult): Promise<CryptoKeyLike> {
-        await this.ensureDependencies();
-
         // Combine credential ID and salt for key derivation
-        const credentialIdBytes = this.base64urlToArrayBuffer(result.rawId);
+        const credentialIdBytes = new Uint8Array(this.base64urlToArrayBuffer(result.rawId));
         const inputKeyMaterial = new Uint8Array(credentialIdBytes.byteLength + NativePasskeyManager.PRF_SALT.length);
-        inputKeyMaterial.set(new Uint8Array(credentialIdBytes), 0);
+        inputKeyMaterial.set(credentialIdBytes, 0);
         inputKeyMaterial.set(NativePasskeyManager.PRF_SALT, credentialIdBytes.byteLength);
 
-        // Use HKDF to derive a 256-bit key
-        const derivedKey = QuickCrypto.createHmac('sha256', NativePasskeyManager.PRF_SALT)
-            .update(Buffer.from(inputKeyMaterial))
-            .digest();
+        // Use SHA256 to derive a 256-bit key (expo-crypto)
+        const derivedKeyBuffer = await Crypto.digest(
+            Crypto.CryptoDigestAlgorithm.SHA256,
+            inputKeyMaterial
+        );
 
         return {
-            rawKey: derivedKey,
+            rawKey: new Uint8Array(derivedKeyBuffer),
             algorithm: 'AES-GCM',
         };
     }
 
     /**
-     * Encrypt data using the derived key
+     * Encrypt data using AES-256-GCM
      */
     async encrypt(key: CryptoKeyLike, data: string): Promise<{ ciphertext: string; iv: string }> {
-        await this.ensureDependencies();
+        const iv = Crypto.getRandomBytes(12); // 96-bit IV for AES-GCM
+        const dataBytes = new TextEncoder().encode(data);
 
-        const iv = QuickCrypto.randomBytes(12); // 96-bit IV for AES-GCM
-        const cipher = QuickCrypto.createCipheriv('aes-256-gcm', key.rawKey, iv);
-
-        let encrypted = cipher.update(data, 'utf8');
-        encrypted = Buffer.concat([encrypted, cipher.final()]);
-        const authTag = cipher.getAuthTag();
-
-        // Combine ciphertext and auth tag
-        const combined = Buffer.concat([encrypted, authTag]);
+        const aes = gcm(key.rawKey, iv);
+        const encrypted = aes.encrypt(dataBytes);
 
         return {
-            ciphertext: combined.toString('base64'),
-            iv: iv.toString('base64'),
+            ciphertext: this.uint8ArrayToBase64(encrypted),
+            iv: this.uint8ArrayToBase64(iv),
         };
     }
 
     /**
-     * Decrypt data using the derived key
+     * Decrypt data using AES-256-GCM
      */
     async decrypt(key: CryptoKeyLike, ciphertext: string, iv: string): Promise<string> {
-        await this.ensureDependencies();
+        const ivBytes = this.base64ToUint8Array(iv);
+        const encryptedBytes = this.base64ToUint8Array(ciphertext);
 
-        const ivBuffer = Buffer.from(iv, 'base64');
-        const combined = Buffer.from(ciphertext, 'base64');
+        const aes = gcm(key.rawKey, ivBytes);
+        const decrypted = aes.decrypt(encryptedBytes);
 
-        // Extract auth tag (last 16 bytes)
-        const authTag = combined.slice(-16);
-        const encryptedData = combined.slice(0, -16);
+        return new TextDecoder().decode(decrypted);
+    }
 
-        const decipher = QuickCrypto.createDecipheriv('aes-256-gcm', key.rawKey, ivBuffer);
-        decipher.setAuthTag(authTag);
+    // Helper: Uint8Array to Base64
+    private uint8ArrayToBase64(bytes: Uint8Array): string {
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return btoa(binary);
+    }
 
-        let decrypted = decipher.update(encryptedData);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-
-        return decrypted.toString('utf8');
+    // Helper: Base64 to Uint8Array
+    private base64ToUint8Array(base64: string): Uint8Array {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes;
     }
 
     // Helper: ArrayBuffer to Base64URL
@@ -193,13 +226,13 @@ export class NativePasskeyManager {
         for (let i = 0; i < bytes.byteLength; i++) {
             binary += String.fromCharCode(bytes[i]);
         }
-        return this.base64ToBase64url(Buffer.from(binary, 'binary').toString('base64'));
+        return this.base64ToBase64url(btoa(binary));
     }
 
     // Helper: Base64URL to ArrayBuffer
     private base64urlToArrayBuffer(base64url: string): ArrayBuffer {
         const base64 = this.base64urlToBase64(base64url);
-        const binary = Buffer.from(base64, 'base64').toString('binary');
+        const binary = atob(base64);
         const len = binary.length;
         const bytes = new Uint8Array(len);
         for (let i = 0; i < len; i++) {
@@ -223,9 +256,9 @@ export class NativePasskeyManager {
 
 /**
  * CryptoKey-like interface for React Native
- * Since we can't use Web Crypto API, we use this structure
+ * Uses Uint8Array instead of Buffer for compatibility
  */
 export interface CryptoKeyLike {
-    rawKey: Buffer;
+    rawKey: Uint8Array;
     algorithm: string;
 }

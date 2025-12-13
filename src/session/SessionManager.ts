@@ -1,10 +1,8 @@
 import { Account, Call, CallData, ec, RpcProvider } from 'starknet';
 import { SessionKey, SessionPolicy, SessionData } from '../types';
+import * as SecureStore from 'expo-secure-store';
 
 const SESSION_DURATION = 24 * 60 * 60 * 1000; // 24 hours
-
-// AsyncStorage for session persistence
-let AsyncStorage: any = null;
 const SESSION_STORAGE_KEY = '@cavos/session';
 
 export class SessionManager {
@@ -17,22 +15,6 @@ export class SessionManager {
         this.provider = new RpcProvider({
             nodeUrl: rpcUrl || 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_8/dql5pMT88iueZWl7L0yzT56uVk0EBU4L',
         });
-    }
-
-    /**
-     * Ensure AsyncStorage is available
-     */
-    private async ensureAsyncStorage(): Promise<void> {
-        if (!AsyncStorage) {
-            try {
-                const module = require('@react-native-async-storage/async-storage');
-                AsyncStorage = module.default || module;
-            } catch (e) {
-                throw new Error(
-                    '@react-native-async-storage/async-storage is required.'
-                );
-            }
-        }
     }
 
     /**
@@ -114,14 +96,13 @@ export class SessionManager {
     }
 
     /**
-     * Save session to AsyncStorage
+     * Save session to SecureStore
      */
     private async saveSessionToStorage(): Promise<void> {
         try {
-            await this.ensureAsyncStorage();
             const sessionData = this.getSessionData();
             if (sessionData) {
-                await AsyncStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(sessionData));
+                await SecureStore.setItemAsync(SESSION_STORAGE_KEY, JSON.stringify(sessionData));
             }
         } catch (error) {
             console.warn('[SessionManager] Failed to save session:', error);
@@ -129,12 +110,11 @@ export class SessionManager {
     }
 
     /**
-     * Load session from AsyncStorage
+     * Load session from SecureStore
      */
     async loadSessionFromStorage(): Promise<boolean> {
         try {
-            await this.ensureAsyncStorage();
-            const data = await AsyncStorage.getItem(SESSION_STORAGE_KEY);
+            const data = await SecureStore.getItemAsync(SESSION_STORAGE_KEY);
             if (!data) return false;
 
             const sessionData = JSON.parse(data) as SessionData;
@@ -240,8 +220,7 @@ export class SessionManager {
         this.accountAddress = null;
 
         try {
-            await this.ensureAsyncStorage();
-            await AsyncStorage.removeItem(SESSION_STORAGE_KEY);
+            await SecureStore.deleteItemAsync(SESSION_STORAGE_KEY);
         } catch (error) {
             console.warn('[SessionManager] Failed to clear session:', error);
         }

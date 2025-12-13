@@ -150,6 +150,49 @@ function WalletScreen() {
 }
 ```
 
+### Passkey-Only Wallet (No OAuth)
+
+Create a wallet with just FaceID/TouchID - no Google/Apple login required:
+
+```tsx
+import { useCavos } from '@cavos/react-native';
+
+function WalletScreen() {
+  const {
+    hasPasskeyOnlyWallet,
+    isPasskeyOnlyMode,
+    address,
+    createPasskeyOnlyWallet,
+    loadPasskeyOnlyWallet,
+  } = useCavos();
+
+  // Create new wallet with passkey
+  const handleCreate = async () => {
+    await createPasskeyOnlyWallet();
+    // Wallet created and deployed!
+  };
+
+  // Load existing passkey wallet
+  const handleLoad = async () => {
+    await loadPasskeyOnlyWallet();
+    // Triggers FaceID/TouchID
+  };
+
+  return (
+    <View>
+      {hasPasskeyOnlyWallet ? (
+        <>
+          <Button onPress={handleLoad} title="Unlock Wallet" />
+          {address && <Text>Address: {address}</Text>}
+        </>
+      ) : (
+        <Button onPress={handleCreate} title="Create Wallet with FaceID" />
+      )}
+    </View>
+  );
+}
+```
+
 ## Cross-Platform Wallet Sharing
 
 To use the same wallet across web and mobile:

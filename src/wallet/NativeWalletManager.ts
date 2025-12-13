@@ -2,9 +2,8 @@ import { Account, CallData, ec, hash, RpcProvider, CairoOption, CairoCustomEnum 
 import { UserInfo, DecryptedWallet } from '../types';
 import { NativePasskeyManager, CryptoKeyLike } from '../security/NativePasskeyManager';
 import axios from 'axios';
-
-// AsyncStorage will be dynamically imported
-let AsyncStorage: any = null;
+import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 
 export class NativeWalletManager {
     private provider: RpcProvider;
@@ -50,22 +49,6 @@ export class NativeWalletManager {
     }
 
     /**
-     * Ensure AsyncStorage is available
-     */
-    private async ensureAsyncStorage(): Promise<void> {
-        if (!AsyncStorage) {
-            try {
-                const module = require('@react-native-async-storage/async-storage');
-                AsyncStorage = module.default || module;
-            } catch (e) {
-                throw new Error(
-                    '@react-native-async-storage/async-storage is required. Install it with: npm install @react-native-async-storage/async-storage'
-                );
-            }
-        }
-    }
-
-    /**
      * Create a new wallet with native Passkey encryption
      */
     async createWallet(user: UserInfo): Promise<Account> {
@@ -82,15 +65,11 @@ export class NativeWalletManager {
         const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
 
         // 3. Register Passkey and derive encryption key
-        const challenge = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) {
-            challenge[i] = Math.floor(Math.random() * 256);
-        }
-
-        const encryptionKey = await this.passkeyManager.register(user.email, challenge);
+        const challenge = Crypto.getRandomBytes(32);
+        const result = await this.passkeyManager.register(user.email, challenge);
 
         // 4. Encrypt private key
-        const { ciphertext, iv } = await this.passkeyManager.encrypt(encryptionKey, privateKeyHex);
+        const { ciphertext, iv } = await this.passkeyManager.encrypt(result.encryptionKey, privateKeyHex);
         const encryptedBlob = `${iv}:${ciphertext}`;
 
         // 5. Save to Backend API
@@ -144,15 +123,11 @@ export class NativeWalletManager {
         }
 
         // Authenticate with Passkey
-        const challenge = new Uint8Array(32);
-        for (let i = 0; i < 32; i++) {
-            challenge[i] = Math.floor(Math.random() * 256);
-        }
-
-        const encryptionKey = await this.passkeyManager.authenticate(challenge);
+        const challenge = Crypto.getRandomBytes(32);
+        const result = await this.passkeyManager.authenticate(challenge);
 
         // Decrypt private key
-        const privateKey = await this.passkeyManager.decrypt(encryptionKey, ciphertext, iv);
+        const privateKey = await this.passkeyManager.decrypt(result.encryptionKey, ciphertext, iv);
 
         // Derive public key
         const privateKeyBytes = Buffer.from(privateKey.replace('0x', ''), 'hex');
@@ -176,12 +151,11 @@ export class NativeWalletManager {
     }
 
     /**
-     * Save wallet to AsyncStorage
+     * Save wallet to SecureStore
      */
     private async saveWalletToStorage(wallet: DecryptedWallet): Promise<void> {
         try {
-            await this.ensureAsyncStorage();
-            await AsyncStorage.setItem(
+            await SecureStore.setItemAsync(
                 NativeWalletManager.WALLET_STORAGE_KEY,
                 JSON.stringify(wallet)
             );
@@ -191,12 +165,11 @@ export class NativeWalletManager {
     }
 
     /**
-     * Load wallet from AsyncStorage
+     * Load wallet from SecureStore
      */
     private async loadWalletFromStorage(): Promise<DecryptedWallet | null> {
         try {
-            await this.ensureAsyncStorage();
-            const data = await AsyncStorage.getItem(NativeWalletManager.WALLET_STORAGE_KEY);
+            const data = await SecureStore.getItemAsync(NativeWalletManager.WALLET_STORAGE_KEY);
             if (!data) return null;
             return JSON.parse(data) as DecryptedWallet;
         } catch (error) {
@@ -210,8 +183,7 @@ export class NativeWalletManager {
      */
     async clearWalletStorage(): Promise<void> {
         try {
-            await this.ensureAsyncStorage();
-            await AsyncStorage.removeItem(NativeWalletManager.WALLET_STORAGE_KEY);
+            await SecureStore.deleteItemAsync(NativeWalletManager.WALLET_STORAGE_KEY);
         } catch (error) {
             console.warn('[NativeWalletManager] Failed to clear wallet storage:', error);
         }

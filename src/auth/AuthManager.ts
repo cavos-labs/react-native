@@ -1,8 +1,6 @@
 import axios from 'axios';
 import { AuthData, UserInfo, OAuthProvider, AuthConfig } from '../types';
-
-// AsyncStorage will be dynamically imported
-let AsyncStorage: any = null;
+import * as SecureStore from 'expo-secure-store';
 
 const STORAGE_KEY = '@cavos/auth_session';
 
@@ -15,22 +13,6 @@ export class AuthManager {
     constructor(config: AuthConfig) {
         this.backendUrl = config.backendUrl;
         this.appId = config.appId;
-    }
-
-    /**
-     * Ensure AsyncStorage is available
-     */
-    private async ensureAsyncStorage(): Promise<void> {
-        if (!AsyncStorage) {
-            try {
-                const module = require('@react-native-async-storage/async-storage');
-                AsyncStorage = module.default || module;
-            } catch (e) {
-                throw new Error(
-                    '@react-native-async-storage/async-storage is required. Install it with: npm install @react-native-async-storage/async-storage'
-                );
-            }
-        }
     }
 
     /**
@@ -105,34 +87,30 @@ export class AuthManager {
     }
 
     /**
-     * Save session to AsyncStorage
+     * Save session to SecureStore
      */
     private async saveSession(): Promise<void> {
         if (!this.authData || !this.provider) return;
 
         try {
-            await this.ensureAsyncStorage();
-
             const sessionData = {
                 authData: this.authData,
                 provider: this.provider,
                 timestamp: Date.now(),
             };
 
-            await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(sessionData));
+            await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(sessionData));
         } catch (error) {
             console.warn('[AuthManager] Failed to save session:', error);
         }
     }
 
     /**
-     * Restore session from AsyncStorage
+     * Restore session from SecureStore
      */
     async restoreSession(): Promise<boolean> {
         try {
-            await this.ensureAsyncStorage();
-
-            const sessionString = await AsyncStorage.getItem(STORAGE_KEY);
+            const sessionString = await SecureStore.getItemAsync(STORAGE_KEY);
             if (!sessionString) return false;
 
             const sessionData = JSON.parse(sessionString);
@@ -193,12 +171,11 @@ export class AuthManager {
     }
 
     /**
-     * Clear session from AsyncStorage
+     * Clear session from SecureStore
      */
     private async clearSession(): Promise<void> {
         try {
-            await this.ensureAsyncStorage();
-            await AsyncStorage.removeItem(STORAGE_KEY);
+            await SecureStore.deleteItemAsync(STORAGE_KEY);
         } catch (error) {
             console.warn('[AuthManager] Failed to clear session:', error);
         }

@@ -1,10 +1,10 @@
-import { Account, Call } from 'starknet';
+import { Account, Call, CallData, ec, hash, RpcProvider, CairoOption, CairoCustomEnum } from 'starknet';
 import { NativeWalletManager } from './wallet/NativeWalletManager';
+import { NativePasskeyManager, PasskeyRegistrationResult, CryptoKeyLike } from './security/NativePasskeyManager';
 import { CavosNativeConfig, UserInfo, DecryptedWallet, LoginProvider, OnrampProvider, TypedData, Signature } from './types';
 import axios from 'axios';
-
-// AsyncStorage for auth token persistence
-let AsyncStorage: any = null;
+import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 
 export class CavosNativeSDK {
     private config: CavosNativeConfig;
@@ -21,7 +21,14 @@ export class CavosNativeSDK {
     private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
     private static readonly AUTH_TOKEN_KEY = '@cavos/auth_token';
     private static readonly USER_INFO_KEY = '@cavos/user_info';
+    private static readonly PASSKEY_WALLET_KEY = '@cavos/passkey_wallet';
     private static readonly BACKEND_URL = 'https://cavos.xyz';
+
+    // Passkey-only wallet state
+    private passkeyWallet: DecryptedWallet | null = null;
+    private passkeyOnlyMode: boolean = false;
+    private passkeyManager: NativePasskeyManager | null = null;
+    private provider: RpcProvider | null = null;
 
     constructor(config: CavosNativeConfig) {
         if (!config.rpId) {
@@ -39,21 +46,7 @@ export class CavosNativeSDK {
         };
     }
 
-    /**
-     * Ensure AsyncStorage is available
-     */
-    private async ensureAsyncStorage(): Promise<void> {
-        if (!AsyncStorage) {
-            try {
-                const module = require('@react-native-async-storage/async-storage');
-                AsyncStorage = module.default || module;
-            } catch (e) {
-                throw new Error(
-                    '@react-native-async-storage/async-storage is required. Install it with: npm install @react-native-async-storage/async-storage'
-                );
-            }
-        }
-    }
+
 
     /**
      * Initialize SDK and restore session if available
@@ -76,10 +69,8 @@ export class CavosNativeSDK {
      */
     private async restoreSession(): Promise<boolean> {
         try {
-            await this.ensureAsyncStorage();
-
-            const token = await AsyncStorage.getItem(CavosNativeSDK.AUTH_TOKEN_KEY);
-            const userInfoStr = await AsyncStorage.getItem(CavosNativeSDK.USER_INFO_KEY);
+            const token = await SecureStore.getItemAsync(CavosNativeSDK.AUTH_TOKEN_KEY);
+            const userInfoStr = await SecureStore.getItemAsync(CavosNativeSDK.USER_INFO_KEY);
 
             if (token && userInfoStr) {
                 this.accessToken = token;
@@ -98,13 +89,11 @@ export class CavosNativeSDK {
      */
     private async saveSession(): Promise<void> {
         try {
-            await this.ensureAsyncStorage();
-
             if (this.accessToken) {
-                await AsyncStorage.setItem(CavosNativeSDK.AUTH_TOKEN_KEY, this.accessToken);
+                await SecureStore.setItemAsync(CavosNativeSDK.AUTH_TOKEN_KEY, this.accessToken);
             }
             if (this.userInfo) {
-                await AsyncStorage.setItem(CavosNativeSDK.USER_INFO_KEY, JSON.stringify(this.userInfo));
+                await SecureStore.setItemAsync(CavosNativeSDK.USER_INFO_KEY, JSON.stringify(this.userInfo));
             }
         } catch (error) {
             console.warn('[CavosNativeSDK] Failed to save session:', error);
@@ -116,9 +105,8 @@ export class CavosNativeSDK {
      */
     private async clearSession(): Promise<void> {
         try {
-            await this.ensureAsyncStorage();
-            await AsyncStorage.removeItem(CavosNativeSDK.AUTH_TOKEN_KEY);
-            await AsyncStorage.removeItem(CavosNativeSDK.USER_INFO_KEY);
+            await SecureStore.deleteItemAsync(CavosNativeSDK.AUTH_TOKEN_KEY);
+            await SecureStore.deleteItemAsync(CavosNativeSDK.USER_INFO_KEY);
         } catch (error) {
             console.warn('[CavosNativeSDK] Failed to clear session:', error);
         }
@@ -437,5 +425,212 @@ export class CavosNativeSDK {
         const hexPart = address.slice(2);
         const paddedHex = hexPart.padStart(64, '0');
         return `0x${paddedHex}`;
+    }
+
+    // ============================================
+    // PASSKEY-ONLY WALLET METHODS (No OAuth needed)
+    // ============================================
+
+    // ArgentX account class hash
+    private static readonly ARGENT_ACCOUNT_CLASS_HASH = '0x036078334509b514626504edc9fb252328d1a240e4e948bef8d0c08dff45927f';
+
+    /**
+     * Create a wallet using ONLY a passkey (FaceID/TouchID)
+     * No OAuth login required. Wallet is stored locally.
+     */
+    async createPasskeyOnlyWallet(): Promise<void> {
+        // Initialize passkey manager
+        this.passkeyManager = new NativePasskeyManager(this.config.rpId);
+
+        // Initialize provider
+        this.provider = new RpcProvider({
+            nodeUrl: this.config.starknetRpcUrl!,
+        });
+
+        // 1. Register passkey with anonymous ID
+        const { encryptionKey, credentialId } = await this.passkeyManager.registerAnonymous();
+
+        // 2. Generate wallet keypair
+        const privateKey = ec.starkCurve.utils.randomPrivateKey();
+        const publicKey = ec.starkCurve.getStarkKey(privateKey);
+
+        // 3. Compute wallet address
+        const address = await this.computePasskeyWalletAddress(publicKey);
+
+        const privateKeyHex = '0x' + Buffer.from(privateKey).toString('hex');
+        const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
+
+        // 4. Encrypt private key
+        const { ciphertext, iv } = await this.passkeyManager.encrypt(encryptionKey, privateKeyHex);
+
+        // 5. Store locally using SecureStore
+        await SecureStore.setItemAsync(
+            CavosNativeSDK.PASSKEY_WALLET_KEY,
+            JSON.stringify({
+                credentialId,
+                address,
+                publicKey: publicKeyHex,
+                encryptedBlob: `${iv}:${ciphertext}`,
+            })
+        );
+
+        // 6. Set wallet state
+        this.passkeyWallet = {
+            address,
+            publicKey: publicKeyHex,
+            privateKey: privateKeyHex,
+        };
+        this.passkeyOnlyMode = true;
+
+        // 7. Auto-deploy
+        await this.deployPasskeyWallet();
+    }
+
+    /**
+     * Load an existing passkey-only wallet
+     * User will be prompted for FaceID/TouchID
+     */
+    async loadPasskeyOnlyWallet(): Promise<void> {
+        // Get stored wallet data
+        const dataStr = await SecureStore.getItemAsync(CavosNativeSDK.PASSKEY_WALLET_KEY);
+        if (!dataStr) {
+            throw new Error('No passkey wallet found');
+        }
+
+        const data = JSON.parse(dataStr);
+
+        // Initialize passkey manager
+        this.passkeyManager = new NativePasskeyManager(this.config.rpId);
+
+        // Initialize provider
+        this.provider = new RpcProvider({
+            nodeUrl: this.config.starknetRpcUrl!,
+        });
+
+        // Authenticate with passkey (triggers FaceID/TouchID)
+        const challenge = Crypto.getRandomBytes(32);
+        const { encryptionKey } = await this.passkeyManager.authenticate(challenge);
+
+        // Decrypt private key
+        const [iv, ciphertext] = data.encryptedBlob.split(':');
+        const privateKeyHex = await this.passkeyManager.decrypt(encryptionKey, ciphertext, iv);
+
+        // Set wallet state
+        this.passkeyWallet = {
+            address: data.address,
+            publicKey: data.publicKey,
+            privateKey: privateKeyHex,
+        };
+        this.passkeyOnlyMode = true;
+    }
+
+    /**
+     * Check if a passkey-only wallet exists locally
+     */
+    async hasPasskeyOnlyWallet(): Promise<boolean> {
+        try {
+            const data = await SecureStore.getItemAsync(CavosNativeSDK.PASSKEY_WALLET_KEY);
+            return data !== null;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Clear passkey-only wallet from local storage
+     */
+    async clearPasskeyOnlyWallet(): Promise<void> {
+        await SecureStore.deleteItemAsync(CavosNativeSDK.PASSKEY_WALLET_KEY);
+        this.passkeyWallet = null;
+        this.passkeyOnlyMode = false;
+    }
+
+    /**
+     * Check if currently using passkey-only mode
+     */
+    isPasskeyOnlyMode(): boolean {
+        return this.passkeyOnlyMode;
+    }
+
+    /**
+     * Get passkey-only wallet address
+     */
+    getPasskeyOnlyAddress(): string | null {
+        return this.passkeyWallet?.address || null;
+    }
+
+    /**
+     * Get passkey-only account for transactions
+     */
+    getPasskeyOnlyAccount(): Account | null {
+        if (!this.passkeyWallet || !this.provider) return null;
+        return new Account(this.provider, this.passkeyWallet.address, this.passkeyWallet.privateKey);
+    }
+
+    /**
+     * Compute wallet address for passkey-only wallet
+     */
+    private async computePasskeyWalletAddress(publicKey: string): Promise<string> {
+        const starkKeyPub = publicKey;
+        const signer = new CairoCustomEnum({ Starknet: { pubkey: starkKeyPub } });
+        const guardian = new CairoOption(1);
+        const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
+
+        return hash.calculateContractAddressFromHash(
+            CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
+            CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
+            constructorCallData,
+            0
+        );
+    }
+
+    /**
+     * Deploy passkey-only wallet via AVNU Paymaster
+     */
+    private async deployPasskeyWallet(): Promise<string> {
+        if (!this.passkeyWallet) throw new Error('No passkey wallet');
+
+        const account = this.getPasskeyOnlyAccount();
+        if (!account) throw new Error('Failed to create account');
+
+        // Build deployment data
+        const starkKeyPub = this.passkeyWallet.publicKey;
+        const signer = new CairoCustomEnum({ Starknet: { pubkey: starkKeyPub } });
+        const guardian = new CairoOption(1);
+        const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
+
+        const deploymentData = {
+            class_hash: CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
+            salt: CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
+            unique: '0x0',
+            calldata: constructorCallData.map((x) => `0x${BigInt(x).toString(16)}`),
+        };
+
+        const network = this.config.network || 'sepolia';
+        const baseUrl = network === 'sepolia'
+            ? 'https://sepolia.api.avnu.fi'
+            : 'https://starknet.api.avnu.fi';
+
+        // Deploy account
+        const deployResponse = await fetch(`${baseUrl}/paymaster/v1/deploy-account`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'api-key': this.config.paymasterApiKey!,
+            },
+            body: JSON.stringify({
+                userAddress: this.passkeyWallet.address,
+                deploymentData,
+            }),
+        });
+
+        if (!deployResponse.ok) throw new Error(await deployResponse.text());
+        const deployResult = await deployResponse.json();
+
+        if (deployResult.transactionHash && this.provider) {
+            await this.provider.waitForTransaction(deployResult.transactionHash);
+        }
+
+        return deployResult.transactionHash;
     }
 }
