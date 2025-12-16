@@ -1,9 +1,10 @@
 import { Account, Call, CallData, ec, RpcProvider } from 'starknet';
 import { SessionKey, SessionPolicy, SessionData } from '../types';
 import * as SecureStore from 'expo-secure-store';
+import * as Crypto from 'expo-crypto';
 
 const SESSION_DURATION = 24 * 60 * 60 * 1000; // 24 hours
-const SESSION_STORAGE_KEY = '@cavos/session';
+const SESSION_STORAGE_KEY = 'cavos.session';
 
 export class SessionManager {
     private sessionKey: SessionKey | null = null;
@@ -18,14 +19,26 @@ export class SessionManager {
     }
 
     /**
+     * Generate a random hex string of specified length
+     */
+    private randomHex(length: number): string {
+        const randomBytes = Crypto.getRandomBytes(Math.ceil(length / 2));
+        let hex = '';
+        for (let i = 0; i < randomBytes.length; i++) {
+            hex += randomBytes[i].toString(16).padStart(2, '0');
+        }
+        return hex.slice(0, length);
+    }
+
+    /**
      * Create a new session key with policy (ON-CHAIN)
      */
     async createSession(
         masterAccount: Account,
         policy: Partial<SessionPolicy> = {}
     ): Promise<SessionKey> {
-        // Generate new session keypair
-        const sessionKeyPair = ec.starkCurve.utils.randomPrivateKey();
+        // Generate new session keypair using 248-bit hex (valid for Stark curve)
+        const sessionKeyPair = `0x00${this.randomHex(62)}`;
         const sessionPublicKey = ec.starkCurve.getStarkKey(sessionKeyPair);
 
         // Default policy: 24 hours validity

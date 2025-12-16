@@ -1,10 +1,9 @@
-import { Account, Call, CallData, ec, hash, RpcProvider, CairoOption, CairoCustomEnum } from 'starknet';
+import { Account, Call } from 'starknet';
+import { TransactionManager } from './transaction/TransactionManager';
 import { NativeWalletManager } from './wallet/NativeWalletManager';
-import { NativePasskeyManager, PasskeyRegistrationResult, CryptoKeyLike } from './security/NativePasskeyManager';
-import { CavosNativeConfig, UserInfo, DecryptedWallet, LoginProvider, OnrampProvider, TypedData, Signature } from './types';
+import { CavosNativeConfig, UserInfo, LoginProvider, OnrampProvider, TypedData, Signature } from './types';
 import axios from 'axios';
 import * as SecureStore from 'expo-secure-store';
-import * as Crypto from 'expo-crypto';
 
 export class CavosNativeSDK {
     private config: CavosNativeConfig;
@@ -19,16 +18,9 @@ export class CavosNativeSDK {
     private static readonly DEFAULT_PAYMASTER_KEY = 'c37c52b7-ea5a-4426-8121-329a78354b0b';
     private static readonly DEFAULT_RPC_MAINNET = 'https://starknet-mainnet.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
     private static readonly DEFAULT_RPC_SEPOLIA = 'https://starknet-sepolia.g.alchemy.com/starknet/version/rpc/v0_10/dql5pMT88iueZWl7L0yzT56uVk0EBU4L';
-    private static readonly AUTH_TOKEN_KEY = '@cavos/auth_token';
-    private static readonly USER_INFO_KEY = '@cavos/user_info';
-    private static readonly PASSKEY_WALLET_KEY = '@cavos/passkey_wallet';
+    private static readonly AUTH_TOKEN_KEY = 'cavos.auth_token';
+    private static readonly USER_INFO_KEY = 'cavos.user_info';
     private static readonly BACKEND_URL = 'https://cavos.xyz';
-
-    // Passkey-only wallet state
-    private passkeyWallet: DecryptedWallet | null = null;
-    private passkeyOnlyMode: boolean = false;
-    private passkeyManager: NativePasskeyManager | null = null;
-    private provider: RpcProvider | null = null;
 
     constructor(config: CavosNativeConfig) {
         if (!config.rpId) {
@@ -46,21 +38,47 @@ export class CavosNativeSDK {
         };
     }
 
-
+    /**
+     * Ensure walletManager is initialized (lazy initialization)
+     * This is called automatically by wallet methods, no need for manual init()
+     */
+    private ensureWalletManager(): NativeWalletManager {
+        if (!this.walletManager) {
+            this.walletManager = new NativeWalletManager(
+                this.config.appId,
+                this.config.rpId,
+                this.config.starknetRpcUrl!,
+                this.config.network || 'sepolia',
+                CavosNativeSDK.BACKEND_URL
+            );
+        }
+        return this.walletManager;
+    }
 
     /**
      * Initialize SDK and restore session if available
+     * Note: This is optional - SDK auto-initializes on first use
      */
     async init(): Promise<void> {
         // Validate MAU limits
         await this.validateAccess();
 
+        // Ensure wallet manager exists
+        this.ensureWalletManager();
+
         // Try to restore auth session
         await this.restoreSession();
 
         if (this.userInfo && this.accessToken) {
-            // Initialize wallet manager
-            await this.initializeWalletManager();
+            // For OAuth users, set the access token and try to load wallet
+            this.walletManager!.setAccessToken(this.accessToken);
+            try {
+                console.log('[CavosNativeSDK] Attempting to load OAuth wallet...');
+                await this.walletManager!.loadWallet(this.userInfo);
+                console.log('[CavosNativeSDK] OAuth wallet loaded:', this.walletManager!.getAddress());
+            } catch (error: any) {
+                console.log('[CavosNativeSDK] No OAuth wallet found or load failed:', error.message);
+            }
         }
     }
 
@@ -132,14 +150,14 @@ export class CavosNativeSDK {
      * Open this URL in a browser/WebView for authentication
      */
     async getLoginUrl(provider: LoginProvider, redirectUri: string): Promise<string> {
-        const response = await axios.get(`${CavosNativeSDK.BACKEND_URL}/api/auth/${provider}`, {
+        const response = await axios.get(`${CavosNativeSDK.BACKEND_URL}/api/auth0/${provider}`, {
             params: {
                 redirect_uri: redirectUri,
                 app_id: this.config.appId,
             },
         });
 
-        return response.data.authorizationUrl;
+        return response.data.url;
     }
 
     /**
@@ -149,6 +167,8 @@ export class CavosNativeSDK {
         if (!this.userInfo || !this.accessToken) {
             throw new Error('User not authenticated');
         }
+
+        console.log('[CavosNativeSDK] Initializing wallet manager for user:', this.userInfo.id);
 
         this.walletManager = new NativeWalletManager(
             this.config.appId,
@@ -162,45 +182,48 @@ export class CavosNativeSDK {
 
         // Try to load existing wallet
         try {
+            console.log('[CavosNativeSDK] Attempting to load wallet from backend...');
             await this.walletManager.loadWallet(this.userInfo);
+            console.log('[CavosNativeSDK] Wallet loaded successfully:', this.walletManager.getAddress());
         } catch (error: any) {
+            console.log('[CavosNativeSDK] loadWallet error:', error.message);
             if (error.message !== 'No wallet found') {
                 throw error;
             }
             // Wallet doesn't exist yet, will need to create
+            console.log('[CavosNativeSDK] No wallet found for this user, will need to create one');
         }
     }
 
     /**
      * Create a new wallet
+     * - For OAuth-authenticated users: creates wallet linked to their social account
+     * - For passkey-only users: creates standalone wallet with passkey
      */
     async createWallet(): Promise<void> {
-        if (!this.userInfo) {
-            throw new Error('User not authenticated');
-        }
+        const manager = this.ensureWalletManager();
 
         if (this.isLimitExceeded) {
             throw new Error('MAU limit reached. Upgrade your plan to create more wallets.');
         }
 
-        if (!this.walletManager) {
-            this.walletManager = new NativeWalletManager(
-                this.config.appId,
-                this.config.rpId,
-                this.config.starknetRpcUrl!,
-                this.config.network || 'sepolia',
-                CavosNativeSDK.BACKEND_URL
+        if (this.userInfo && this.accessToken) {
+            // OAuth mode: create wallet linked to social account
+            manager.setAccessToken(this.accessToken);
+            await manager.createWallet(this.userInfo);
+            await manager.deployAccountWithPaymaster(
+                this.config.paymasterApiKey!,
+                this.config.network || 'sepolia'
             );
-            this.walletManager.setAccessToken(this.accessToken!);
+        } else {
+            // Passkey-only mode: Smart Flow (Recover -> Create)
+            try {
+                await manager.recoverWalletWithPasskey();
+            } catch (error) {
+                // If recovery fails (e.g. user cancels or no passkey), create new
+                await manager.createPasskeyOnlyWallet(this.config.paymasterApiKey!);
+            }
         }
-
-        await this.walletManager.createWallet(this.userInfo);
-
-        // Auto-deploy
-        await this.walletManager.deployAccountWithPaymaster(
-            this.config.paymasterApiKey!,
-            this.config.network || 'sepolia'
-        );
     }
 
     /**
@@ -223,74 +246,28 @@ export class CavosNativeSDK {
     }
 
     /**
-     * Execute a transaction
+     * Execute a transaction using the active account (unified across passkey-only and OAuth)
      */
     async execute(calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> {
-        const account = this.getAccount();
+        const account = this.getActiveAccount();
         if (!account) {
-            throw new Error('Account not initialized. Please login first.');
+            throw new Error('No account available. Please create or load a wallet first.');
         }
 
-        const callsArray = Array.isArray(calls) ? calls : [calls];
+        const network = this.config.network || 'sepolia';
+        const apiKey = this.config.paymasterApiKey;
 
-        if (options?.gasless !== false) {
-            // Use AVNU Paymaster for gasless execution
-            const network = this.config.network || 'sepolia';
-            const baseUrl = network === 'sepolia'
-                ? 'https://sepolia.api.avnu.fi'
-                : 'https://starknet.api.avnu.fi';
-
-            // Build typed data
-            const typedDataResponse = await fetch(`${baseUrl}/paymaster/v1/build-typed-data`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': this.config.paymasterApiKey!,
-                },
-                body: JSON.stringify({
-                    userAddress: account.address,
-                    calls: callsArray.map(call => ({
-                        contractAddress: call.contractAddress,
-                        entrypoint: call.entrypoint,
-                        calldata: call.calldata || [],
-                    })),
-                }),
-            });
-
-            if (!typedDataResponse.ok) {
-                throw new Error(await typedDataResponse.text());
-            }
-
-            const typedData = await typedDataResponse.json();
-
-            // Sign
-            const signature = await account.signMessage(typedData.typedData);
-
-            // Execute
-            const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': this.config.paymasterApiKey!,
-                },
-                body: JSON.stringify({
-                    userAddress: account.address,
-                    typedData: typedData.typedData,
-                    signature: Array.isArray(signature) ? signature : [signature.r, signature.s],
-                }),
-            });
-
-            if (!executeResponse.ok) {
-                throw new Error(await executeResponse.text());
-            }
-
-            const result = await executeResponse.json();
-            return result.transactionHash;
-        } else {
-            // Regular execution (user pays gas)
-            const result = await account.execute(callsArray);
-            return result.transaction_hash;
+        if (!apiKey) {
+            throw new Error('Paymaster API Key is required for transactions');
         }
+
+        const txManager = new TransactionManager(
+            account,
+            apiKey,
+            network
+        );
+
+        return txManager.execute(calls, options);
     }
 
     /**
@@ -336,9 +313,44 @@ export class CavosNativeSDK {
         this.walletManager = null;
     }
 
-    // Getters
-    getAddress(): string | null {
+    // Unified getters that work with any wallet type (passkey-only or OAuth)
+
+    /**
+     * Get the active wallet address (unified across passkey-only and OAuth)
+     */
+    getActiveAddress(): string | null {
+        // Try passkey-only first
+        const passkeyAddr = this.getPasskeyOnlyAddress();
+        if (passkeyAddr) {
+            return passkeyAddr;
+        }
+        // Then try OAuth wallet
         return this.walletManager?.getAddress() || null;
+    }
+
+    /**
+ * Get the active account (unified across passkey-only and OAuth)
+ */
+    getActiveAccount(): Account | null {
+        console.log('[CavosNativeSDK] getActiveAccount called');
+        console.log('[CavosNativeSDK] walletManager exists:', !!this.walletManager);
+        console.log('[CavosNativeSDK] walletManager mode:', this.walletManager?.getMode());
+
+        // Try passkey-only first
+        const passkeyAccount = this.getPasskeyOnlyAccount();
+        console.log('[CavosNativeSDK] passkeyAccount:', !!passkeyAccount);
+        if (passkeyAccount) {
+            return passkeyAccount;
+        }
+        // Then try OAuth wallet
+        const oauthAccount = this.walletManager?.getAccount() || null;
+        console.log('[CavosNativeSDK] oauthAccount:', !!oauthAccount);
+        return oauthAccount;
+    }
+
+    // Legacy getters (for backwards compatibility)
+    getAddress(): string | null {
+        return this.getActiveAddress();
     }
 
     getUserInfo(): UserInfo | null {
@@ -367,7 +379,7 @@ export class CavosNativeSDK {
     }
 
     getAccount(): Account | null {
-        return this.walletManager?.getAccount() || null;
+        return this.getActiveAccount();
     }
 
     /**
@@ -428,209 +440,93 @@ export class CavosNativeSDK {
     }
 
     // ============================================
-    // PASSKEY-ONLY WALLET METHODS (No OAuth needed)
+    // WALLET LOADING & MANAGEMENT
     // ============================================
 
-    // ArgentX account class hash
-    private static readonly ARGENT_ACCOUNT_CLASS_HASH = '0x036078334509b514626504edc9fb252328d1a240e4e948bef8d0c08dff45927f';
-
     /**
-     * Create a wallet using ONLY a passkey (FaceID/TouchID)
-     * No OAuth login required. Wallet is stored locally.
-     */
-    async createPasskeyOnlyWallet(): Promise<void> {
-        // Initialize passkey manager
-        this.passkeyManager = new NativePasskeyManager(this.config.rpId);
-
-        // Initialize provider
-        this.provider = new RpcProvider({
-            nodeUrl: this.config.starknetRpcUrl!,
-        });
-
-        // 1. Register passkey with anonymous ID
-        const { encryptionKey, credentialId } = await this.passkeyManager.registerAnonymous();
-
-        // 2. Generate wallet keypair
-        const privateKey = ec.starkCurve.utils.randomPrivateKey();
-        const publicKey = ec.starkCurve.getStarkKey(privateKey);
-
-        // 3. Compute wallet address
-        const address = await this.computePasskeyWalletAddress(publicKey);
-
-        const privateKeyHex = '0x' + Buffer.from(privateKey).toString('hex');
-        const publicKeyHex = publicKey.startsWith('0x') ? publicKey : '0x' + publicKey;
-
-        // 4. Encrypt private key
-        const { ciphertext, iv } = await this.passkeyManager.encrypt(encryptionKey, privateKeyHex);
-
-        // 5. Store locally using SecureStore
-        await SecureStore.setItemAsync(
-            CavosNativeSDK.PASSKEY_WALLET_KEY,
-            JSON.stringify({
-                credentialId,
-                address,
-                publicKey: publicKeyHex,
-                encryptedBlob: `${iv}:${ciphertext}`,
-            })
-        );
-
-        // 6. Set wallet state
-        this.passkeyWallet = {
-            address,
-            publicKey: publicKeyHex,
-            privateKey: privateKeyHex,
-        };
-        this.passkeyOnlyMode = true;
-
-        // 7. Auto-deploy
-        await this.deployPasskeyWallet();
-    }
-
-    /**
-     * Load an existing passkey-only wallet
+     * Load an existing wallet 
      * User will be prompted for FaceID/TouchID
      */
+    async loadWallet(): Promise<void> {
+        const manager = this.ensureWalletManager();
+        await manager.loadPasskeyOnlyWallet();
+    }
+
+    /**
+     * Check if a wallet exists locally
+     */
+    async hasWalletLocally(): Promise<boolean> {
+        const manager = this.ensureWalletManager();
+        return manager.hasPasskeyOnlyWallet();
+    }
+
+    /**
+     * Recover wallet from backend using an existing passkey
+     */
+    async recoverWallet(): Promise<void> {
+        const manager = this.ensureWalletManager();
+        await manager.recoverWalletWithPasskey();
+    }
+
+    /**
+     * Clear wallet from local storage
+     */
+    async clearWallet(): Promise<void> {
+        const manager = this.ensureWalletManager();
+        await manager.clearPasskeyOnlyWallet();
+    }
+
+    // ============================================
+    // LEGACY PASSKEY-ONLY METHODS (Deprecated)
+    // ============================================
+
+    /** @deprecated Use createWallet() instead */
+    async createPasskeyOnlyWallet(): Promise<void> {
+        return this.createWallet();
+    }
+
+    /** @deprecated Use loadWallet() instead */
     async loadPasskeyOnlyWallet(): Promise<void> {
-        // Get stored wallet data
-        const dataStr = await SecureStore.getItemAsync(CavosNativeSDK.PASSKEY_WALLET_KEY);
-        if (!dataStr) {
-            throw new Error('No passkey wallet found');
-        }
-
-        const data = JSON.parse(dataStr);
-
-        // Initialize passkey manager
-        this.passkeyManager = new NativePasskeyManager(this.config.rpId);
-
-        // Initialize provider
-        this.provider = new RpcProvider({
-            nodeUrl: this.config.starknetRpcUrl!,
-        });
-
-        // Authenticate with passkey (triggers FaceID/TouchID)
-        const challenge = Crypto.getRandomBytes(32);
-        const { encryptionKey } = await this.passkeyManager.authenticate(challenge);
-
-        // Decrypt private key
-        const [iv, ciphertext] = data.encryptedBlob.split(':');
-        const privateKeyHex = await this.passkeyManager.decrypt(encryptionKey, ciphertext, iv);
-
-        // Set wallet state
-        this.passkeyWallet = {
-            address: data.address,
-            publicKey: data.publicKey,
-            privateKey: privateKeyHex,
-        };
-        this.passkeyOnlyMode = true;
+        return this.loadWallet();
     }
 
-    /**
-     * Check if a passkey-only wallet exists locally
-     */
+    /** @deprecated Use recoverWallet() instead */
+    async recoverWalletWithPasskey(): Promise<void> {
+        return this.recoverWallet();
+    }
+
+    /** @deprecated Use hasWalletLocally() instead */
     async hasPasskeyOnlyWallet(): Promise<boolean> {
-        try {
-            const data = await SecureStore.getItemAsync(CavosNativeSDK.PASSKEY_WALLET_KEY);
-            return data !== null;
-        } catch {
-            return false;
-        }
+        return this.hasWalletLocally();
     }
 
-    /**
-     * Clear passkey-only wallet from local storage
-     */
+    /** @deprecated Use clearWallet() instead */
     async clearPasskeyOnlyWallet(): Promise<void> {
-        await SecureStore.deleteItemAsync(CavosNativeSDK.PASSKEY_WALLET_KEY);
-        this.passkeyWallet = null;
-        this.passkeyOnlyMode = false;
+        return this.clearWallet();
     }
 
     /**
      * Check if currently using passkey-only mode
      */
     isPasskeyOnlyMode(): boolean {
-        return this.passkeyOnlyMode;
+        return this.walletManager?.isPasskeyOnlyMode() || false;
     }
 
-    /**
-     * Get passkey-only wallet address
-     */
+    /** @deprecated Use getAddress() instead */
     getPasskeyOnlyAddress(): string | null {
-        return this.passkeyWallet?.address || null;
-    }
-
-    /**
-     * Get passkey-only account for transactions
-     */
-    getPasskeyOnlyAccount(): Account | null {
-        if (!this.passkeyWallet || !this.provider) return null;
-        return new Account(this.provider, this.passkeyWallet.address, this.passkeyWallet.privateKey);
-    }
-
-    /**
-     * Compute wallet address for passkey-only wallet
-     */
-    private async computePasskeyWalletAddress(publicKey: string): Promise<string> {
-        const starkKeyPub = publicKey;
-        const signer = new CairoCustomEnum({ Starknet: { pubkey: starkKeyPub } });
-        const guardian = new CairoOption(1);
-        const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
-
-        return hash.calculateContractAddressFromHash(
-            CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
-            CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
-            constructorCallData,
-            0
-        );
-    }
-
-    /**
-     * Deploy passkey-only wallet via AVNU Paymaster
-     */
-    private async deployPasskeyWallet(): Promise<string> {
-        if (!this.passkeyWallet) throw new Error('No passkey wallet');
-
-        const account = this.getPasskeyOnlyAccount();
-        if (!account) throw new Error('Failed to create account');
-
-        // Build deployment data
-        const starkKeyPub = this.passkeyWallet.publicKey;
-        const signer = new CairoCustomEnum({ Starknet: { pubkey: starkKeyPub } });
-        const guardian = new CairoOption(1);
-        const constructorCallData = CallData.compile({ owner: signer, guardian: guardian });
-
-        const deploymentData = {
-            class_hash: CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
-            salt: CavosNativeSDK.ARGENT_ACCOUNT_CLASS_HASH,
-            unique: '0x0',
-            calldata: constructorCallData.map((x) => `0x${BigInt(x).toString(16)}`),
-        };
-
-        const network = this.config.network || 'sepolia';
-        const baseUrl = network === 'sepolia'
-            ? 'https://sepolia.api.avnu.fi'
-            : 'https://starknet.api.avnu.fi';
-
-        // Deploy account
-        const deployResponse = await fetch(`${baseUrl}/paymaster/v1/deploy-account`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'api-key': this.config.paymasterApiKey!,
-            },
-            body: JSON.stringify({
-                userAddress: this.passkeyWallet.address,
-                deploymentData,
-            }),
-        });
-
-        if (!deployResponse.ok) throw new Error(await deployResponse.text());
-        const deployResult = await deployResponse.json();
-
-        if (deployResult.transactionHash && this.provider) {
-            await this.provider.waitForTransaction(deployResult.transactionHash);
+        // Use walletManager directly to avoid recursion with getActiveAddress
+        if (this.walletManager?.isPasskeyOnlyMode()) {
+            return this.walletManager.getAddress();
         }
+        return null;
+    }
 
-        return deployResult.transactionHash;
+    /** @deprecated Use getAccount() instead */
+    getPasskeyOnlyAccount(): Account | null {
+        // Use walletManager directly to avoid recursion with getActiveAccount
+        if (this.walletManager?.isPasskeyOnlyMode()) {
+            return this.walletManager.getAccount();
+        }
+        return null;
     }
 }

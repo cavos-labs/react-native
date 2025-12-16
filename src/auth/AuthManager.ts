@@ -2,7 +2,7 @@ import axios from 'axios';
 import { AuthData, UserInfo, OAuthProvider, AuthConfig } from '../types';
 import * as SecureStore from 'expo-secure-store';
 
-const STORAGE_KEY = '@cavos/auth_session';
+const STORAGE_KEY = 'cavos.auth_session';
 
 export class AuthManager {
     private backendUrl: string;

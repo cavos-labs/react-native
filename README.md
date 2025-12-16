@@ -1,251 +1,182 @@
 # @cavos/react-native
 
-Cavos SDK for React Native - Invisible crypto infrastructure with native passkeys.
+A library to add secure, easy-to-use wallets to your React Native (Expo) application.
 
-## Features
+It lets your users log in with Google or Apple and creates a secure wallet for them. They do not need to worry about private keys or seed phrases.
 
-- Native Passkey (FaceID/TouchID) authentication
-- Non-custodial wallet management
-- Gasless transactions via AVNU Paymaster
-- Cross-platform passkey support (share wallets between web and mobile)
-- Same API as `@cavos/react`
+## Why use this?
+
+*   **Easy Login:** Users sign in with their existing Google or Apple accounts.
+*   **Secure:** The private keys are created on the user's device, encrypted with their passkeys (FaceID/TouchID) which generates a blob saved on our platform for the user to restore it. Only the user can access their wallet.
+*   **Free Transactions:** We pay the gas fees for your users, so they do not need to buy ETH or STRK to start using your app.
+*   **Works Everywhere:** Users can access their wallet from any device by logging in.
 
 ## Installation
 
+Run this command in your project folder:
+
 ```bash
-npm install @cavos/react-native
-
-# Required peer dependencies
-npm install react-native-passkey react-native-quick-crypto @react-native-async-storage/async-storage
-
+npm install @cavos/react-native starknet react-native-passkey expo-secure-store expo-crypto
 ```
 
-## Platform Configuration
+> **Note:** This SDK is designed for Expo environments (managed or bare). Ensure you have configured `react-native-passkey` correctly for your platform (iOS/Android).
 
-### iOS Setup
+## How to use it
 
-1. Add Associated Domains capability in Xcode
-2. Add your domain to the entitlements:
+### 1. Setup
 
-```xml
-<key>com.apple.developer.associated-domains</key>
-<array>
-    <string>webcredentials:YOUR_DOMAIN.com</string>
-</array>
-```
-
-3. Host the Apple App Site Association file at `https://YOUR_DOMAIN.com/.well-known/apple-app-site-association`:
-
-```json
-{
-  "webcredentials": {
-    "apps": ["TEAM_ID.com.yourapp.bundleid"]
-  }
-}
-```
-
-### Android Setup
-
-1. Host the Asset Links file at `https://YOUR_DOMAIN.com/.well-known/assetlinks.json`:
-
-```json
-[{
-  "relation": ["delegate_permission/common.get_login_creds"],
-  "target": {
-    "namespace": "android_app",
-    "package_name": "com.yourapp",
-    "sha256_cert_fingerprints": ["YOUR_SHA256_FINGERPRINT"]
-  }
-}]
-```
-
-## Usage
-
-### Basic Setup
+Wrap your application with the `CavosNativeProvider`. This makes the wallet features available throughout your app.
 
 ```tsx
-import { CavosNativeProvider, useCavos } from '@cavos/react-native';
+import { CavosNativeProvider } from '@cavos/react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 
-export default function App() {
+export default function RootLayout() {
   return (
-    <CavosNativeProvider
-      appId="your-app-id"
-      rpId="yourapp.com"  // Must match your web domain!
-      network="mainnet"
-    >
-      <WalletScreen />
-    </CavosNativeProvider>
+    <SafeAreaProvider>
+      <CavosNativeProvider
+        config={{
+          appId: 'your-app-id', // Get this from your Cavos dashboard
+          rpId: 'app.yourdomain.com', // REQUIRED: Your associated domain for Passkeys
+          network: 'sepolia', // Use 'mainnet' or 'sepolia'
+        }}
+      >
+        <Stack />
+      </CavosNativeProvider>
+    </SafeAreaProvider>
   );
 }
 ```
 
-### Authentication
+### 2. Login Buttons
+
+Add buttons to let users log in.
 
 ```tsx
-import { useCavos } from '@cavos/react-native';
-import { Linking } from 'react-native';
+import { useCavosNative } from '@cavos/react-native';
+import { View, TouchableOpacity, Text } from 'react-native';
 
 function LoginScreen() {
-  const { getLoginUrl, setAuthData, isAuthenticated } = useCavos();
+  const { login, isAuthenticated, user, createWallet } = useCavosNative();
 
-  const handleLogin = async () => {
-    // Get OAuth URL
-    const url = await getLoginUrl('google', 'yourapp://auth/callback');
-    
-    // Open in browser
-    await Linking.openURL(url);
-  };
-
-  // Handle deep link callback in your app
-  const handleAuthCallback = async (authData) => {
-    await setAuthData(authData);
-  };
-
-  return (
-    <Button onPress={handleLogin} title="Login with Google" />
-  );
-}
-```
-
-### Wallet Operations
-
-```tsx
-import { useCavos } from '@cavos/react-native';
-
-function WalletScreen() {
-  const {
-    address,
-    isLoading,
-    requiresWalletCreation,
-    createWallet,
-    execute,
-    getBalance,
-  } = useCavos();
-
-  // Create wallet (triggers FaceID/TouchID)
-  const handleCreateWallet = async () => {
-    await createWallet();
-  };
-
-  // Execute transaction (gasless by default)
-  const handleTransfer = async () => {
-    const txHash = await execute({
-      contractAddress: '0x...',
-      entrypoint: 'transfer',
-      calldata: ['0x...', '1000000000000000000'],
-    });
-    console.log('Transaction:', txHash);
-  };
-
-  if (requiresWalletCreation) {
-    return <Button onPress={handleCreateWallet} title="Setup Wallet" />;
+  if (isAuthenticated) {
+    return <Text>Hello, {user?.email}!</Text>;
   }
 
   return (
     <View>
-      <Text>Address: {address}</Text>
-      <Button onPress={handleTransfer} title="Send Transaction" />
+      <TouchableOpacity onPress={() => login('google')}>
+        <Text>Login with Google</Text>
+      </TouchableOpacity>
+        
+      <TouchableOpacity onPress={() => login('apple')}>
+        <Text>Login with Apple</Text>
+      </TouchableOpacity>
+
+      {/* Passkey-Only Option */}
+      <TouchableOpacity onPress={createWallet}>
+         <Text>Continue with Passkey</Text>
+      </TouchableOpacity>
     </View>
   );
 }
 ```
 
-### Passkey-Only Wallet (No OAuth)
+### 3. Creating the Wallet
 
-Create a wallet with just FaceID/TouchID - no Google/Apple login required:
+After logging in (or if using Passkey-only mode), the user needs to create their wallet. This happens automatically with a secure passkey (FaceID or TouchID). 
+
+The `createWallet` function handles the entire flow:
+1. If logged in with OAuth: Creates a wallet linked to the social account.
+2. If NOT logged in: Attempts to recover an existing passkey wallet; if none found, creates a new one.
+
+### 4. Sending Transactions
+
+You can send transactions on the blockchain easily.
 
 ```tsx
-import { useCavos } from '@cavos/react-native';
+import { useCavosNative } from '@cavos/react-native';
 
-function WalletScreen() {
-  const {
-    hasPasskeyOnlyWallet,
-    isPasskeyOnlyMode,
-    address,
-    createPasskeyOnlyWallet,
-    loadPasskeyOnlyWallet,
-  } = useCavos();
+function SendMoney() {
+  const { execute } = useCavosNative();
 
-  // Create new wallet with passkey
-  const handleCreate = async () => {
-    await createPasskeyOnlyWallet();
-    // Wallet created and deployed!
-  };
-
-  // Load existing passkey wallet
-  const handleLoad = async () => {
-    await loadPasskeyOnlyWallet();
-    // Triggers FaceID/TouchID
+  const handleSend = async () => {
+    try {
+      const transactionHash = await execute(
+        {
+          contractAddress: '0x...', 
+          entrypoint: 'transfer', 
+          calldata: ['0x...', '1000', '0'],
+        },
+        { gasless: true } 
+      );
+      console.log('Transaction hash:', transactionHash);
+    } catch (error) {
+      console.error('Transaction failed:', error);
+    }
   };
 
   return (
-    <View>
-      {hasPasskeyOnlyWallet ? (
-        <>
-          <Button onPress={handleLoad} title="Unlock Wallet" />
-          {address && <Text>Address: {address}</Text>}
-        </>
-      ) : (
-        <Button onPress={handleCreate} title="Create Wallet with FaceID" />
-      )}
-    </View>
+    <TouchableOpacity onPress={handleSend}>
+      <Text>Send Transaction</Text>
+    </TouchableOpacity>
   );
 }
 ```
 
-## Cross-Platform Wallet Sharing
+### 5. Buying Crypto (Onramp)
 
-To use the same wallet across web and mobile:
+You can let users buy crypto with their credit card. *Note: React Native implementation may vary depending on deep linking setup.*
 
-1. **Web App**: User creates wallet on `yourapp.com`
-2. **Mobile App**: Configure `rpId: 'yourapp.com'`
-3. **Platform Config**: Set up Associated Domains (iOS) and Asset Links (Android)
+```tsx
+import { useCavosNative } from '@cavos/react-native';
+import * as Linking from 'expo-linking';
 
-The passkey created on web will be available on mobile via iCloud Keychain (iOS) or Google Password Manager (Android).
+function BuyCrypto() {
+  const { getOnramp } = useCavosNative();
 
-## API Reference
-
-### CavosNativeProvider Props
-
-| Prop | Type | Required | Description |
-|------|------|----------|-------------|
-| `appId` | `string` | Yes | Your Cavos App ID |
-| `rpId` | `string` | Yes | Relying Party ID (your domain) |
-| `network` | `'mainnet' \| 'sepolia'` | No | Starknet network (default: 'sepolia') |
-| `paymasterApiKey` | `string` | No | Custom paymaster API key |
-
-### useCavos() Hook
-
-```typescript
-{
-  // State
-  isInitialized: boolean;
-  isLoading: boolean;
-  isAuthenticated: boolean;
-  address: string | null;
-  user: UserInfo | null;
-  error: Error | null;
-  requiresWalletCreation: boolean;
-
-  // Methods
-  getLoginUrl(provider, redirectUri): Promise<string>;
-  setAuthData(authData): Promise<void>;
-  logout(): Promise<void>;
-  createWallet(): Promise<void>;
-  retryWalletUnlock(): Promise<void>;
-  execute(calls, options?): Promise<string>;
-  getBalance(): Promise<string>;
-  getOnramp(provider): string;
-  isPasskeySupported(): Promise<boolean>;
+  const handleBuy = async () => {
+    try {
+      const url = getOnramp('RAMP_NETWORK');
+      await Linking.openURL(url);
+    } catch (error) {
+      console.error('Error:', error);
+    }
+  };
 }
 ```
 
-## Requirements
+### 6. Handling Wallet Unlock Errors
 
-- iOS 15.0+
-- Android API 28+
-- React Native 0.72+
+If a user cancels the passkey prompt, you can allow them to retry.
 
-## License
+```tsx
+import { useCavosNative } from '@cavos/react-native';
 
-MIT
+function WalletStatus() {
+  const { isAuthenticated, address, retryWalletUnlock } = useCavosNative();
+
+  if (isAuthenticated && !address) {
+    return (
+      <View>
+        <Text>Your wallet needs to be unlocked.</Text>
+        <TouchableOpacity onPress={() => retryWalletUnlock()}>
+           <Text>Unlock Wallet</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
+}
+```
+
+### 7. Account Deletion
+
+Allow users to delete their account.
+
+```tsx
+const { deleteAccount } = useCavosNative();
+// ...
+await deleteAccount();
+```
+
+For advanced usage (Signature, Custom RPC, Paymasters), see [ADVANCED.md](./ADVANCED.md).

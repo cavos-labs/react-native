@@ -25,6 +25,7 @@ let Passkey: any = null;
 export class NativePasskeyManager {
     private rpId: string;
     private static readonly RP_NAME = 'Cavos Wallet';
+    // Must match WebAuthnManager.ts from React SDK
     private static readonly PRF_SALT = new Uint8Array(32).fill(1);
 
     constructor(rpId: string) {
@@ -60,7 +61,7 @@ export class NativePasskeyManager {
     }
 
     /**
-     * Register a new Passkey and derive an encryption key
+     * Register a new Passkey and derive an encryption key using PRF
      * @param userId User's unique identifier (e.g. email or social ID)
      * @param challenge Random challenge for registration
      * @returns Encryption key and credential ID
@@ -70,8 +71,9 @@ export class NativePasskeyManager {
 
         const challengeB64 = this.arrayBufferToBase64url(challenge.buffer as ArrayBuffer);
         const userIdB64 = this.arrayBufferToBase64url(new TextEncoder().encode(userId).buffer as ArrayBuffer);
+        const saltB64 = this.arrayBufferToBase64url(NativePasskeyManager.PRF_SALT.buffer as ArrayBuffer);
 
-        const result: PasskeyResult = await Passkey.register({
+        const request = {
             challenge: challengeB64,
             rp: {
                 id: this.rpId,
@@ -85,21 +87,57 @@ export class NativePasskeyManager {
             authenticatorSelection: {
                 authenticatorAttachment: 'platform',
                 requireResidentKey: true,
+                residentKey: 'required',
                 userVerification: 'required',
             },
             pubKeyCredParams: [
                 { alg: -7, type: 'public-key' },   // ES256
                 { alg: -257, type: 'public-key' }, // RS256
             ],
-        });
-
-        // Derive encryption key from credential data
-        const encryptionKey = await this.deriveKeyFromCredential(result);
-
-        return {
-            encryptionKey,
-            credentialId: result.rawId,
+            extensions: {
+                prf: {
+                    eval: {
+                        first: NativePasskeyManager.PRF_SALT
+                    }
+                }
+            }
         };
+
+        try {
+            const result: any = await Passkey.createPlatformKey(request);
+
+            // Extract PRF result
+            const clientExtensionResults = result.clientExtensionResults;
+            const prfResult = clientExtensionResults?.prf;
+
+            if (!prfResult || !prfResult.results || !prfResult.results.first) {
+                throw new Error('PRF extension not supported by authenticator or failed');
+            }
+
+            // The PRF result is key material
+            const prfFirst = prfResult.results.first;
+            let rawKeyBytes: Uint8Array;
+
+            if (typeof prfFirst === 'string') {
+                rawKeyBytes = this.base64urlToUint8Array(prfFirst);
+            } else if (prfFirst instanceof Uint8Array) {
+                rawKeyBytes = prfFirst;
+            } else {
+                // Try to cast or handle generic object
+                rawKeyBytes = new Uint8Array(Object.values(prfFirst));
+            }
+
+            return {
+                encryptionKey: {
+                    rawKey: rawKeyBytes,
+                    algorithm: 'AES-GCM'
+                },
+                credentialId: result.rawId,
+            };
+        } catch (error: any) {
+            console.error('[NativePasskeyManager] Registration failed details:', JSON.stringify(error, null, 2));
+            throw error;
+        }
     }
 
     /**
@@ -124,7 +162,7 @@ export class NativePasskeyManager {
     }
 
     /**
-     * Authenticate with existing Passkey and derive the same encryption key
+     * Authenticate with existing Passkey and derive the same encryption key using PRF
      * @param challenge Random challenge for authentication
      * @returns Encryption key and credential ID
      */
@@ -132,43 +170,53 @@ export class NativePasskeyManager {
         await this.ensureDependencies();
 
         const challengeB64 = this.arrayBufferToBase64url(challenge.buffer as ArrayBuffer);
+        const saltB64 = this.arrayBufferToBase64url(NativePasskeyManager.PRF_SALT.buffer as ArrayBuffer);
 
-        const result: PasskeyResult = await Passkey.authenticate({
-            challenge: challengeB64,
-            rpId: this.rpId,
-            userVerification: 'required',
-        });
+        try {
+            const result: any = await Passkey.get({
+                challenge: challengeB64,
+                rpId: this.rpId,
+                userVerification: 'required',
+                extensions: {
+                    prf: {
+                        eval: {
+                            first: NativePasskeyManager.PRF_SALT
+                        }
+                    }
+                }
+            });
 
-        // Derive encryption key from credential data
-        const encryptionKey = await this.deriveKeyFromCredential(result);
+            // Extract PRF result
+            const clientExtensionResults = result.clientExtensionResults;
+            const prfResult = clientExtensionResults?.prf;
 
-        return {
-            encryptionKey,
-            credentialId: result.rawId,
-        };
-    }
+            if (!prfResult || !prfResult.results || !prfResult.results.first) {
+                throw new Error('PRF extension not supported by authenticator or failed');
+            }
 
-    /**
-     * Derive a stable encryption key from passkey credential
-     * Uses HMAC-SHA256 via expo-crypto
-     */
-    private async deriveKeyFromCredential(result: PasskeyResult): Promise<CryptoKeyLike> {
-        // Combine credential ID and salt for key derivation
-        const credentialIdBytes = new Uint8Array(this.base64urlToArrayBuffer(result.rawId));
-        const inputKeyMaterial = new Uint8Array(credentialIdBytes.byteLength + NativePasskeyManager.PRF_SALT.length);
-        inputKeyMaterial.set(credentialIdBytes, 0);
-        inputKeyMaterial.set(NativePasskeyManager.PRF_SALT, credentialIdBytes.byteLength);
+            // The PRF result is key material
+            const prfFirst = prfResult.results.first;
+            let rawKeyBytes: Uint8Array;
 
-        // Use SHA256 to derive a 256-bit key (expo-crypto)
-        const derivedKeyBuffer = await Crypto.digest(
-            Crypto.CryptoDigestAlgorithm.SHA256,
-            inputKeyMaterial
-        );
+            if (typeof prfFirst === 'string') {
+                rawKeyBytes = this.base64urlToUint8Array(prfFirst);
+            } else if (prfFirst instanceof Uint8Array) {
+                rawKeyBytes = prfFirst;
+            } else {
+                rawKeyBytes = new Uint8Array(Object.values(prfFirst));
+            }
 
-        return {
-            rawKey: new Uint8Array(derivedKeyBuffer),
-            algorithm: 'AES-GCM',
-        };
+            return {
+                encryptionKey: {
+                    rawKey: rawKeyBytes,
+                    algorithm: 'AES-GCM'
+                },
+                credentialId: result.rawId,
+            };
+        } catch (error) {
+            console.error('[NativePasskeyManager] Authentication failed:', error);
+            throw error;
+        }
     }
 
     /**
@@ -200,7 +248,7 @@ export class NativePasskeyManager {
         return new TextDecoder().decode(decrypted);
     }
 
-    // Helper: Uint8Array to Base64
+    // Helper: Uint8Array to Base64 (Standard)
     private uint8ArrayToBase64(bytes: Uint8Array): string {
         let binary = '';
         for (let i = 0; i < bytes.length; i++) {
@@ -209,7 +257,7 @@ export class NativePasskeyManager {
         return btoa(binary);
     }
 
-    // Helper: Base64 to Uint8Array
+    // Helper: Base64 to Uint8Array (Standard)
     private base64ToUint8Array(base64: string): Uint8Array {
         const binary = atob(base64);
         const bytes = new Uint8Array(binary.length);
@@ -229,8 +277,8 @@ export class NativePasskeyManager {
         return this.base64ToBase64url(btoa(binary));
     }
 
-    // Helper: Base64URL to ArrayBuffer
-    private base64urlToArrayBuffer(base64url: string): ArrayBuffer {
+    // Helper: Base64URL to Uint8Array
+    private base64urlToUint8Array(base64url: string): Uint8Array {
         const base64 = this.base64urlToBase64(base64url);
         const binary = atob(base64);
         const len = binary.length;
@@ -238,7 +286,7 @@ export class NativePasskeyManager {
         for (let i = 0; i < len; i++) {
             bytes[i] = binary.charCodeAt(i);
         }
-        return bytes.buffer;
+        return bytes;
     }
 
     private base64ToBase64url(base64: string): string {

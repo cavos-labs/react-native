@@ -64,10 +64,23 @@ export class TransactionManager {
                 throw new Error(await buildResponse.text());
             }
 
-            const typedData = await buildResponse.json();
+            const typedDataResponse = await buildResponse.json();
 
             // Step 2: Sign the typed data
-            const signature = await this.account.signMessage(typedData.typedData);
+            const signature = await this.account.signMessage(typedDataResponse);
+
+            // Helper to format signature elements as hex strings
+            const formatSignature = (sig: any): string[] => {
+                const toHex = (val: any) => {
+                    const str = val.toString(16);
+                    return str.startsWith('0x') ? str : `0x${str}`;
+                };
+
+                if (Array.isArray(sig)) {
+                    return sig.map(toHex);
+                }
+                return [toHex(sig.r), toHex(sig.s)];
+            };
 
             // Step 3: Execute via paymaster
             const executeResponse = await fetch(`${baseUrl}/paymaster/v1/execute`, {
@@ -78,8 +91,9 @@ export class TransactionManager {
                 },
                 body: JSON.stringify({
                     userAddress: this.account.address,
-                    typedData: typedData.typedData,
-                    signature: Array.isArray(signature) ? signature : [signature.r, signature.s],
+                    typedData: JSON.stringify(typedDataResponse), // Must be a stringified JSON
+                    signature: formatSignature(signature),
+                    deploymentData: null,
                 }),
             });
 

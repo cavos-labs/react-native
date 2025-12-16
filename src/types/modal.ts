@@ -28,4 +28,12 @@ export interface PasskeyResult {
         authenticatorData?: string;
         signature?: string;
     };
+    clientExtensionResults?: {
+        prf?: {
+            results?: {
+                first?: string;
+                second?: string;
+            };
+        };
+    };
 }

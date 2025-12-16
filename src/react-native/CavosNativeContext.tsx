@@ -1,284 +1,202 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
-import { Account, Call } from 'starknet';
+import { Call } from 'starknet';
 import { CavosNativeSDK } from '../CavosNativeSDK';
 import { CavosNativeConfig, UserInfo, LoginProvider, OnrampProvider } from '../types';
+import * as WebBrowser from 'expo-web-browser';
+import * as AuthSession from 'expo-auth-session';
 
+// Simplified context interface matching React SDK
 interface CavosNativeContextValue {
-    // State
-    isInitialized: boolean;
-    isLoading: boolean;
+    // Core state
+    cavos: CavosNativeSDK;
     isAuthenticated: boolean;
-    address: string | null;
     user: UserInfo | null;
-    error: Error | null;
+    address: string | null;
+    isLoading: boolean;
     requiresWalletCreation: boolean;
 
-    // Passkey-only state
-    isPasskeyOnlyMode: boolean;
-    hasPasskeyOnlyWallet: boolean;
-
-    // Auth methods
-    getLoginUrl: (provider: LoginProvider, redirectUri: string) => Promise<string>;
-    setAuthData: (authData: { access_token: string; user: UserInfo }) => Promise<void>;
+    // Auth - simplified API
+    login: (provider: LoginProvider, redirectUri?: string) => Promise<void>;
     logout: () => Promise<void>;
 
-    // Wallet methods
+    // Wallet
     createWallet: () => Promise<void>;
-    retryWalletUnlock: () => Promise<void>;
 
-    // Passkey-only wallet methods
-    createPasskeyOnlyWallet: () => Promise<void>;
-    loadPasskeyOnlyWallet: () => Promise<void>;
-    clearPasskeyOnlyWallet: () => Promise<void>;
-
-    // Transaction methods
+    // Transactions
     execute: (calls: Call | Call[], options?: { gasless?: boolean }) => Promise<string>;
 
-    // Utility methods
-    getBalance: () => Promise<string>;
+    // Utility
     getOnramp: (provider: OnrampProvider) => string;
-    isPasskeySupported: () => Promise<boolean>;
-
-    // SDK instance (for advanced usage)
-    sdk: CavosNativeSDK | null;
 }
 
 const CavosNativeContext = createContext<CavosNativeContextValue | null>(null);
 
-interface CavosNativeProviderProps extends CavosNativeConfig {
+interface CavosNativeProviderProps {
+    config: CavosNativeConfig;
     children: ReactNode;
 }
 
-export function CavosNativeProvider({
-    children,
-    ...config
-}: CavosNativeProviderProps) {
-    const [sdk, setSdk] = useState<CavosNativeSDK | null>(null);
-    const [isInitialized, setIsInitialized] = useState(false);
-    const [isLoading, setIsLoading] = useState(true);
+export function CavosNativeProvider({ config, children }: CavosNativeProviderProps) {
+    // Create SDK once
+    const [cavos] = useState(() => new CavosNativeSDK(config));
+
+    // State
     const [isAuthenticated, setIsAuthenticated] = useState(false);
-    const [address, setAddress] = useState<string | null>(null);
     const [user, setUser] = useState<UserInfo | null>(null);
-    const [error, setError] = useState<Error | null>(null);
+    const [address, setAddress] = useState<string | null>(null);
+    const [isLoading, setIsLoading] = useState(true);
     const [requiresWalletCreation, setRequiresWalletCreation] = useState(false);
 
-    // Passkey-only state
-    const [isPasskeyOnlyMode, setIsPasskeyOnlyMode] = useState(false);
-    const [hasPasskeyOnlyWallet, setHasPasskeyOnlyWallet] = useState(false);
-
-    // Initialize SDK
+    // Initialize on mount
     useEffect(() => {
-        const initSDK = async () => {
+        const initialize = async () => {
             try {
                 setIsLoading(true);
-                setError(null);
 
-                const sdkInstance = new CavosNativeSDK(config);
-                await sdkInstance.init();
-
-                setSdk(sdkInstance);
-                setIsInitialized(true);
-                setIsAuthenticated(sdkInstance.isAuthenticated());
-                setAddress(sdkInstance.getAddress() || sdkInstance.getPasskeyOnlyAddress());
-                setUser(sdkInstance.getUserInfo());
-                setIsPasskeyOnlyMode(sdkInstance.isPasskeyOnlyMode());
-
-                // Check for passkey-only wallet
-                const hasPasskey = await sdkInstance.hasPasskeyOnlyWallet();
-                setHasPasskeyOnlyWallet(hasPasskey);
-
-                // Check if wallet creation is needed
-                if (sdkInstance.isAuthenticated() && !sdkInstance.getAddress()) {
-                    const hasWallet = await sdkInstance.hasWallet();
-                    setRequiresWalletCreation(!hasWallet);
+                // Check for existing passkey wallet first
+                const hasLocalWallet = await cavos.hasWalletLocally();
+                if (hasLocalWallet) {
+                    try {
+                        await cavos.loadWallet();
+                        setAddress(cavos.getAddress());
+                        setIsAuthenticated(true);
+                    } catch (e) {
+                        console.log('[CavosProvider] Needs passkey auth to load wallet');
+                    }
+                    setIsLoading(false);
+                    return;
                 }
-            } catch (err) {
-                console.error('[CavosNativeProvider] Initialization failed:', err);
-                setError(err as Error);
+
+                // Try to restore OAuth session
+                await cavos.init();
+
+                if (cavos.isAuthenticated()) {
+                    setIsAuthenticated(true);
+                    setUser(cavos.getUserInfo());
+
+                    const addr = cavos.getAddress();
+                    if (addr) {
+                        setAddress(addr);
+                    } else {
+                        // Has OAuth session but no wallet
+                        const hasWallet = await cavos.hasWallet();
+                        setRequiresWalletCreation(!hasWallet);
+                    }
+                }
+            } catch (error) {
+                console.error('[CavosProvider] Init error:', error);
             } finally {
                 setIsLoading(false);
             }
         };
 
-        initSDK();
-    }, [config.appId, config.rpId, config.network]);
+        initialize();
+    }, [cavos]);
 
-    // Get login URL
-    const getLoginUrl = useCallback(async (provider: LoginProvider, redirectUri: string): Promise<string> => {
-        if (!sdk) throw new Error('SDK not initialized');
-        return sdk.getLoginUrl(provider, redirectUri);
-    }, [sdk]);
-
-    // Set auth data after OAuth
-    const setAuthData = useCallback(async (authData: { access_token: string; user: UserInfo }): Promise<void> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
+    // Unified login - works like React SDK: login('google') or login('apple')
+    const login = useCallback(async (provider: LoginProvider, redirectUri?: string) => {
         setIsLoading(true);
         try {
-            await sdk.setAuthData(authData);
-            setIsAuthenticated(true);
-            setUser(authData.user);
-            setAddress(sdk.getAddress());
+            // Get login URL from backend
+            const finalRedirectUri = redirectUri || AuthSession.makeRedirectUri({ scheme: 'cavos' });
+            const loginUrl = await cavos.getLoginUrl(provider, finalRedirectUri);
 
-            // Check if wallet creation is needed
-            if (!sdk.getAddress()) {
-                const hasWallet = await sdk.hasWallet();
-                setRequiresWalletCreation(!hasWallet);
+            // Open browser for OAuth
+            const result = await WebBrowser.openAuthSessionAsync(loginUrl, finalRedirectUri);
+
+            if (result.type === 'success' && result.url) {
+                // Parse auth_data from callback URL
+                const url = new URL(result.url);
+                const authData = url.searchParams.get('auth_data');
+
+                if (authData) {
+                    // Decode the auth data
+                    let decodedData = decodeURIComponent(authData);
+                    while (decodedData.startsWith('%7B') || decodedData.startsWith('%257B')) {
+                        decodedData = decodeURIComponent(decodedData);
+                    }
+
+                    const parsedData = JSON.parse(decodedData);
+
+                    // Set auth data in SDK
+                    await cavos.setAuthData({
+                        access_token: parsedData.access_token,
+                        user: parsedData.user,
+                    });
+
+                    // Update state
+                    setIsAuthenticated(true);
+                    setUser(parsedData.user);
+
+                    // Check if wallet exists
+                    const hasWallet = await cavos.hasWallet();
+                    if (hasWallet) {
+                        setAddress(cavos.getAddress());
+                        setRequiresWalletCreation(false);
+                    } else {
+                        setRequiresWalletCreation(true);
+                    }
+                }
             }
-        } catch (err) {
-            setError(err as Error);
-            throw err;
+        } catch (error) {
+            console.error('[CavosProvider] Login error:', error);
+            throw error;
         } finally {
             setIsLoading(false);
         }
-    }, [sdk]);
+    }, [cavos]);
 
-    // Logout
-    const logout = useCallback(async (): Promise<void> => {
-        if (!sdk) return;
-
-        await sdk.logout();
+    // Logout - clears both OAuth and local wallet
+    const logout = useCallback(async () => {
+        await cavos.logout();
+        await cavos.clearWallet();
         setIsAuthenticated(false);
-        setAddress(null);
         setUser(null);
-        setRequiresWalletCreation(false);
-    }, [sdk]);
-
-    // Create wallet (OAuth flow)
-    const createWallet = useCallback(async (): Promise<void> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
-        setIsLoading(true);
-        try {
-            await sdk.createWallet();
-            setAddress(sdk.getAddress());
-            setRequiresWalletCreation(false);
-        } catch (err) {
-            setError(err as Error);
-            throw err;
-        } finally {
-            setIsLoading(false);
-        }
-    }, [sdk]);
-
-    // Retry wallet unlock
-    const retryWalletUnlock = useCallback(async (): Promise<void> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
-        setIsLoading(true);
-        try {
-            await sdk.retryWalletUnlock();
-            setAddress(sdk.getAddress());
-            setRequiresWalletCreation(false);
-        } catch (err) {
-            setError(err as Error);
-            throw err;
-        } finally {
-            setIsLoading(false);
-        }
-    }, [sdk]);
-
-    // Create passkey-only wallet (no OAuth)
-    const createPasskeyOnlyWallet = useCallback(async (): Promise<void> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
-        setIsLoading(true);
-        try {
-            await sdk.createPasskeyOnlyWallet();
-            setAddress(sdk.getPasskeyOnlyAddress());
-            setIsPasskeyOnlyMode(true);
-            setHasPasskeyOnlyWallet(true);
-        } catch (err) {
-            setError(err as Error);
-            throw err;
-        } finally {
-            setIsLoading(false);
-        }
-    }, [sdk]);
-
-    // Load passkey-only wallet
-    const loadPasskeyOnlyWallet = useCallback(async (): Promise<void> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
-        setIsLoading(true);
-        try {
-            await sdk.loadPasskeyOnlyWallet();
-            setAddress(sdk.getPasskeyOnlyAddress());
-            setIsPasskeyOnlyMode(true);
-        } catch (err) {
-            setError(err as Error);
-            throw err;
-        } finally {
-            setIsLoading(false);
-        }
-    }, [sdk]);
-
-    // Clear passkey-only wallet
-    const clearPasskeyOnlyWallet = useCallback(async (): Promise<void> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
-        await sdk.clearPasskeyOnlyWallet();
         setAddress(null);
-        setIsPasskeyOnlyMode(false);
-        setHasPasskeyOnlyWallet(false);
-    }, [sdk]);
+        setRequiresWalletCreation(false);
+    }, [cavos]);
+
+    // Create wallet - unified for both OAuth and passkey-only
+    const createWallet = useCallback(async () => {
+        setIsLoading(true);
+        try {
+            await cavos.createWallet();
+            setAddress(cavos.getAddress());
+            setRequiresWalletCreation(false);
+            // For passkey-only, mark as authenticated after wallet creation
+            if (!user) {
+                setIsAuthenticated(true);
+            }
+        } catch (error) {
+            console.error('[CavosProvider] Create wallet error:', error);
+            throw error;
+        } finally {
+            setIsLoading(false);
+        }
+    }, [cavos, user]);
 
     // Execute transaction
-    const execute = useCallback(async (calls: Call | Call[], options?: { gasless?: boolean }): Promise<string> => {
-        if (!sdk) throw new Error('SDK not initialized');
-
-        // Use passkey-only account if in passkey mode
-        if (sdk.isPasskeyOnlyMode()) {
-            const account = sdk.getPasskeyOnlyAccount();
-            if (!account) throw new Error('Passkey wallet not loaded');
-            // For now, use the SDK's execute which will need to be updated to support passkey-only
-            return sdk.execute(calls, options);
-        }
-
-        return sdk.execute(calls, options);
-    }, [sdk]);
-
-    // Get balance
-    const getBalance = useCallback(async (): Promise<string> => {
-        if (!sdk) return '0';
-        return sdk.getBalance();
-    }, [sdk]);
+    const execute = useCallback(async (calls: Call | Call[], options?: { gasless?: boolean }) => {
+        return cavos.execute(calls, options);
+    }, [cavos]);
 
     // Get onramp URL
-    const getOnramp = useCallback((provider: OnrampProvider): string => {
-        if (!sdk) throw new Error('SDK not initialized');
-        return sdk.getOnramp(provider);
-    }, [sdk]);
-
-    // Check passkey support
-    const isPasskeySupported = useCallback(async (): Promise<boolean> => {
-        if (!sdk) return false;
-        return sdk.isPasskeySupported();
-    }, [sdk]);
+    const getOnramp = useCallback((provider: OnrampProvider) => {
+        return cavos.getOnramp(provider);
+    }, [cavos]);
 
     const value: CavosNativeContextValue = {
-        isInitialized,
-        isLoading,
+        cavos,
         isAuthenticated,
-        address,
         user,
-        error,
+        address,
+        isLoading,
         requiresWalletCreation,
-        isPasskeyOnlyMode,
-        hasPasskeyOnlyWallet,
-        getLoginUrl,
-        setAuthData,
+        login,
         logout,
         createWallet,
-        retryWalletUnlock,
-        createPasskeyOnlyWallet,
-        loadPasskeyOnlyWallet,
-        clearPasskeyOnlyWallet,
         execute,
-        getBalance,
         getOnramp,
-        isPasskeySupported,
-        sdk,
     };
 
     return (
@@ -289,7 +207,7 @@ export function CavosNativeProvider({
 }
 
 /**
- * Hook to access Cavos Native SDK
+ * Hook to access Cavos SDK - same API as React web SDK
  */
 export function useCavosNative(): CavosNativeContextValue {
     const context = useContext(CavosNativeContext);
@@ -299,6 +217,5 @@ export function useCavosNative(): CavosNativeContextValue {
     return context;
 }
 
-// Alias for API consistency with web SDK
+// Alias for consistency with web SDK
 export const useCavos = useCavosNative;
-

@@ -1,3 +1,7 @@
+// IMPORTANT: Import polyfills FIRST before any other modules
+// This ensures crypto.getRandomValues is available before starknet/noble libraries load
+import './polyfills/crypto';
+
 // Main SDK
 export { CavosNativeSDK } from './CavosNativeSDK';
 
