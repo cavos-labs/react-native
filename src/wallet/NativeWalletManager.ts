@@ -101,7 +101,7 @@ export class NativeWalletManager {
         // Save to local storage
         await this.saveWalletToStorage(this.currentWallet);
 
-        this.currentAccount = new Account(this.provider, address, privateKeyHex);
+        this.currentAccount = new Account({ provider: this.provider, address, signer: privateKeyHex });
         this.walletMode = 'oauth';
 
         // Track MAU
@@ -120,7 +120,7 @@ export class NativeWalletManager {
         const cachedWallet = await this.loadWalletFromStorage();
         if (cachedWallet) {
             this.currentWallet = cachedWallet;
-            this.currentAccount = new Account(this.provider, cachedWallet.address, cachedWallet.privateKey);
+            this.currentAccount = new Account({ provider: this.provider, address: cachedWallet.address, signer: cachedWallet.privateKey });
             this.walletMode = 'oauth';
             await this.trackUsage(cachedWallet.address);
             return this.currentAccount;
@@ -160,7 +160,7 @@ export class NativeWalletManager {
         // Save to local storage
         await this.saveWalletToStorage(this.currentWallet);
 
-        this.currentAccount = new Account(this.provider, address, privateKey);
+        this.currentAccount = new Account({ provider: this.provider, address, signer: privateKey });
         this.walletMode = 'oauth';
 
         await this.trackUsage(address);
@@ -472,7 +472,7 @@ export class NativeWalletManager {
             publicKey: publicKeyHex,
             privateKey: privateKeyHex,
         };
-        this.currentAccount = new Account(this.provider, address, privateKeyHex);
+        this.currentAccount = new Account({ provider: this.provider, address, signer: privateKeyHex });
         this.walletMode = 'passkey-only';
 
         // 7. Auto-deploy wallet
@@ -512,7 +512,7 @@ export class NativeWalletManager {
             publicKey: data.publicKey,
             privateKey: privateKeyHex,
         };
-        this.currentAccount = new Account(this.provider, data.address, privateKeyHex);
+        this.currentAccount = new Account({ provider: this.provider, address: data.address, signer: privateKeyHex });
         this.walletMode = 'passkey-only';
     }
 
@@ -556,7 +556,7 @@ export class NativeWalletManager {
             publicKey: publicKeyHex,
             privateKey: privateKeyHex,
         };
-        this.currentAccount = new Account(this.provider, backendWallet.address, privateKeyHex);
+        this.currentAccount = new Account({ provider: this.provider, address: backendWallet.address, signer: privateKeyHex });
         this.walletMode = 'passkey-only';
 
         console.log('[NativeWalletManager] Wallet recovered from backend successfully');

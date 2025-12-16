@@ -94,11 +94,11 @@ export class SessionManager {
             createdAt: Date.now(),
         };
 
-        this.sessionAccount = new Account(
-            this.provider,
-            masterAccount.address,
-            this.sessionKey.privateKey
-        );
+        this.sessionAccount = new Account({
+            provider: this.provider,
+            address: masterAccount.address,
+            signer: this.sessionKey.privateKey,
+        });
 
         this.accountAddress = masterAccount.address;
 
@@ -150,11 +150,11 @@ export class SessionManager {
             throw new Error('Session has expired');
         }
 
-        this.sessionAccount = new Account(
-            this.provider,
-            sessionData.accountAddress,
-            sessionData.sessionKey.privateKey
-        );
+        this.sessionAccount = new Account({
+            provider: this.provider,
+            address: sessionData.accountAddress,
+            signer: sessionData.sessionKey.privateKey,
+        });
     }
 
     /**
